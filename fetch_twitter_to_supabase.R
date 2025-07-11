@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 # ---------------------------------------------------------------
-#  Scrape tweets for a set of handles and upsert into Supabase
+#  Scrape tweets for a set of handles and upsert into Supabase,
+#  plus snapshot follower counts to user_followers.
 #  Requires: R >= 4.2, Python 3.8+, GitHub Actions secrets set
 # ---------------------------------------------------------------
 
@@ -80,12 +81,33 @@ empty_df <- tibble::tibble(
   is_quote=logical(), is_retweet=logical(), engagement_rate=numeric()
 )
 
+### NEW ▸ follower-snapshot tibble  ------------------------------
+followers_df <- tibble::tibble(
+  username        = character(),
+  user_id         = character(),
+  followers_count = numeric(),
+  snapshot_time   = as.POSIXct(character())
+)
+
 # ── Block B: verbose scrape_one() ───────────────────────────────
 scrape_one <- function(user, limit = 150L) {
   tryCatch({
     info   <- asyncio$run(api$user_by_login(user))
+
+    ### NEW ▸ store follower count for this account
+    followers_df <<- dplyr::bind_rows(
+      followers_df,
+      tibble(
+        username        = user,
+        user_id         = as_chr(info$id),
+        followers_count = as_num(info$followersCount),
+        snapshot_time   = Sys.time()
+      )
+    )
+
     tweets <- asyncio$run(
-                twscrape$gather(api$user_tweets_and_replies(info$id, limit = limit))
+                twscrape$gather(api$user_tweets_and_replies(info$id,
+                                                            limit = limit))
               )
     message(sprintf("✅ %s → %d tweets", user, py_len(tweets)))
     purrr::map_dfr(
@@ -134,6 +156,7 @@ con <- DBI::dbConnect(
   sslmode = "require"
 )
 
+## 4a – tweets table (unchanged) ---------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS twitter_raw (
     tweet_id text PRIMARY KEY,
@@ -172,8 +195,26 @@ DBI::dbExecute(con, "
     engagement_rate  = EXCLUDED.engagement_rate;
 ")
 
-
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_twitter_raw;")
+
+## 4b – NEW ▸ user_followers table --------------------------------
+DBI::dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS user_followers (
+    user_id         text,
+    username        text,
+    followers_count bigint,
+    snapshot_time   timestamptz DEFAULT now(),
+    PRIMARY KEY (user_id, snapshot_time)
+  );
+")
+
+DBI::dbWriteTable(con,
+                  name      = "user_followers",
+                  value     = followers_df,
+                  append    = TRUE,
+                  row.names = FALSE)
+
+## 5 – wrap-up ----------------------------------------------------
 DBI::dbDisconnect(con)
 
-message("✅ Tweets scraped & upserted at ", Sys.time())
+message("✅ Tweets & follower counts upserted at ", Sys.time())
