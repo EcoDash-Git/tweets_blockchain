@@ -69,10 +69,8 @@ tweet_to_list <- function(tw, user) {
     bookmarked_count = bok,
     view_count       = view,
     date             = py_str(tw$date),
-is_quote   = !py_eval("x is None", convert = TRUE,
-                      local = list(x = tw$quotedTweet)),
-is_retweet = !py_eval("x is None", convert = TRUE,
-                      local = list(x = tw$retweetedTweet)),
+is_quote   = !is.null(py_to_r(tw$quotedTweet)),
+is_retweet = !is.null(py_to_r(tw$retweetedTweet)),
     engagement_rate  = er
   )
 }
