@@ -13,7 +13,7 @@ if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
 invisible(lapply(need, library, character.only = TRUE))
 
 ## 1 – Python env & twscrape ------------------------------------
-venv <- Sys.getenv("PY_VENV_PATH", ".venv")    # default: project-local
+venv <- Sys.getenv("PY_VENV_PATH", ".venv")    # default: project‑local
 if (!dir.exists(venv)) {
   reticulate::virtualenv_create(venv, python = NULL)
   reticulate::virtualenv_install(venv, "twscrape")
@@ -29,8 +29,10 @@ cookie_json <- Sys.getenv("TW_COOKIES_JSON")
 if (cookie_json == "") stop("TW_COOKIES_JSON env var not set")
 
 cookies_list <- jsonlite::fromJSON(cookie_json)
-cookies_str  <- paste(paste0(cookies_list$name, "=", cookies_list$value),
-                      collapse = "; ")
+cookies_str  <- paste(
+  paste0(cookies_list$name, "=", cookies_list$value),
+  collapse = "; "
+)
 
 asyncio$run(api$pool$add_account("x", "x", "x", "x", cookies = cookies_str))
 
@@ -81,7 +83,7 @@ empty_df <- tibble::tibble(
   is_quote=logical(), is_retweet=logical(), engagement_rate=numeric()
 )
 
-### NEW ▸ follower-snapshot tibble  ------------------------------
+### ▸ follower‑snapshot tibble -----------------------------------
 followers_df <- tibble::tibble(
   username        = character(),
   user_id         = character(),
@@ -89,56 +91,56 @@ followers_df <- tibble::tibble(
   snapshot_time   = as.POSIXct(character())
 )
 
-# ── Block B: verbose scrape_one() ───────────────────────────────
+# ── Block B: scrape_one() ---------------------------------------
 scrape_one <- function(user, limit = 150L) {
   tryCatch({
-    info   <- asyncio$run(api$user_by_login(user))
+    info  <- asyncio$run(api$user_by_login(user))
+    me_id <- as_chr(info$id)          # ← owner’s ID (always correct)
 
-    ### NEW ▸ store follower count for this account
+    # store follower count
     followers_df <<- dplyr::bind_rows(
       followers_df,
       tibble(
         username        = user,
-        user_id         = as_chr(info$id),
+        user_id         = me_id,
         followers_count = as_num(info$followersCount),
         snapshot_time   = Sys.time()
       )
     )
 
     tweets <- asyncio$run(
-                twscrape$gather(api$user_tweets_and_replies(info$id,
-                                                            limit = limit))
-              )
+               twscrape$gather(
+                 api$user_tweets_and_replies(info$id, limit = limit)
+               )
+             )
+
     message(sprintf("✅ %s → %d tweets", user, py_len(tweets)))
+
     purrr::map_dfr(
       0:(py_len(tweets) - 1),
       ~ tweet_to_list(tweets$`__getitem__`(.x), user)
-    )
+    ) |>
+    mutate(main_id = me_id)           # keep owner ID for each row
   }, error = function(e) {
     message(sprintf("❌ %s → %s", user, conditionMessage(e)))
     empty_df
   })
 }
 
+# ── Collect tweets for all handles ------------------------------
 all_tweets <- purrr::map_dfr(handles, scrape_one)
 
 if (nrow(all_tweets) == 0) {
   stop("No tweets scraped from any handle — aborting run.")
 }
 
+# Simple, safe flag adjustment (no lag‑trick needed)
 all_tweets <- all_tweets |>
-  arrange(username, lubridate::ymd_hms(date)) |>
-  group_by(username) |>
-  mutate(main_id = first(user_id),
-         is_quote = if_else(is_quote == FALSE &
-                            lag(is_quote, default = FALSE) == TRUE &
-                            user_id != main_id, TRUE, is_quote),
-         is_retweet = if_else(user_id != main_id & is_quote == FALSE,
-                              TRUE, is_retweet)) |>
-  ungroup() |>
+  mutate(
+    is_retweet = (user_id != main_id) & !is_quote
+  ) |>
   distinct(tweet_id, .keep_all = TRUE) |>
-  dplyr::select(-main_id)            # ← drop helper column
-
+  dplyr::select(-main_id)    # drop helper column
 
 ## 4 – Supabase connection ---------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
@@ -156,7 +158,7 @@ con <- DBI::dbConnect(
   sslmode = "require"
 )
 
-## 4a – tweets table (unchanged) ---------------------------------
+## 4a – tweets table ---------------------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS twitter_raw (
     tweet_id text PRIMARY KEY,
@@ -197,7 +199,7 @@ DBI::dbExecute(con, "
 
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_twitter_raw;")
 
-## 4b – NEW ▸ user_followers table --------------------------------
+## 4b – user_followers table -------------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS user_followers (
     user_id         text,
@@ -214,7 +216,8 @@ DBI::dbWriteTable(con,
                   append    = TRUE,
                   row.names = FALSE)
 
-## 5 – wrap-up ----------------------------------------------------
+## 5 – wrap‑up ----------------------------------------------------
 DBI::dbDisconnect(con)
 
 message("✅ Tweets & follower counts upserted at ", Sys.time())
+
