@@ -69,8 +69,8 @@ tweet_to_list <- function(tw, user) {
     bookmarked_count = bok,
     view_count       = view,
     date             = py_str(tw$date),
-    is_quote         = !identical(tw$quotedTweet,    py_none),
-    is_retweet       = !identical(tw$retweetedTweet, py_none),
+   is_quote         = (py_str(tw$quotedTweet)    != "None"),
+is_retweet       = (py_str(tw$retweetedTweet) != "None"),
     engagement_rate  = er
   )
 }
@@ -136,11 +136,9 @@ if (nrow(all_tweets) == 0) {
 
 # Simple, safe flag adjustment (no lag‑trick needed)
 all_tweets <- all_tweets |>
-  mutate(
-    is_retweet = (user_id != main_id) & !is_quote
-  ) |>
   distinct(tweet_id, .keep_all = TRUE) |>
-  dplyr::select(-main_id)    # drop helper column
+  dplyr::select(-main_id)
+
 
 ## 4 – Supabase connection ---------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
