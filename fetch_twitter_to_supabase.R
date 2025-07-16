@@ -182,6 +182,7 @@ DBI::dbExecute(con, "
          view_count, date::timestamptz, is_quote, is_retweet, engagement_rate
   FROM dedup
   ON CONFLICT (tweet_id) DO UPDATE SET
+    tweet_url        = EXCLUDED.tweet_url,        
     reply_count      = EXCLUDED.reply_count,
     retweet_count    = EXCLUDED.retweet_count,
     like_count       = EXCLUDED.like_count,
