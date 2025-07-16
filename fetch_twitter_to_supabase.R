@@ -2,7 +2,6 @@
 # ---------------------------------------------------------------
 #  Scrape tweets for a set of handles and upsert into Supabase,
 #  plus snapshot follower counts to user_followers.
-#  Requires: R >= 4.2, Python 3.8+, GitHub Actions secrets set
 # ---------------------------------------------------------------
 
 ## 0 – packages --------------------------------------------------
@@ -13,7 +12,7 @@ if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
 invisible(lapply(need, library, character.only = TRUE))
 
 ## 1 – Python env & twscrape ------------------------------------
-venv <- Sys.getenv("PY_VENV_PATH", ".venv")    # default: project‑local
+venv <- Sys.getenv("PY_VENV_PATH", ".venv")
 if (!dir.exists(venv)) {
   reticulate::virtualenv_create(venv, python = NULL)
   reticulate::virtualenv_install(venv, "twscrape")
@@ -24,19 +23,15 @@ twscrape <- import("twscrape", convert = FALSE)
 asyncio  <- import("asyncio",  convert = FALSE)
 api      <- twscrape$API()
 
-## 2 – Add account (needs cookies) -------------------------------
+## 2 – Add account (needs cookies) ------------------------------
 cookie_json <- Sys.getenv("TW_COOKIES_JSON")
 if (cookie_json == "") stop("TW_COOKIES_JSON env var not set")
 
 cookies_list <- jsonlite::fromJSON(cookie_json)
-cookies_str  <- paste(
-  paste0(cookies_list$name, "=", cookies_list$value),
-  collapse = "; "
-)
-
+cookies_str  <- paste(paste0(cookies_list$name, "=", cookies_list$value),
+                      collapse = "; ")
 asyncio$run(api$pool$add_account("x", "x", "x", "x", cookies = cookies_str))
 
-# ── Block A: quick diagnostics ─────────────────────────────────
 message(sprintf("✅ %d cookies loaded, total chars = %d",
                 nrow(cookies_list), nchar(cookies_str)))
 
@@ -45,7 +40,6 @@ handles <- trimws(strsplit(
             Sys.getenv("TW_HANDLES",
                        "aoTheComputer,ar_io_network,samecwilliams"), ","
           )[[1]])
-
 message("✅ Handles: ", paste(handles, collapse = ", "))
 
 py_none <- import_builtins()$None
@@ -57,9 +51,13 @@ tweet_to_list <- function(tw, user) {
   rt   <- as_num(tw$retweetCount); like <- as_num(tw$likeCount)
   quo  <- as_num(tw$quoteCount);   bok  <- as_num(tw$bookmarkedCount)
   er   <- if (!is.na(view) && view > 0) 100*(rep+rt+like+quo+bok)/view else NA
+  id_str  <- py_str(tw$id)
+  url_str <- sprintf("https://twitter.com/%s/status/%s", user, id_str)
+
   list(
     username = user,
-    tweet_id = py_str(tw$id),
+    tweet_id = id_str,
+    tweet_url = url_str,                # ← NEW COLUMN
     user_id  = as_chr(tw$user$id),
     text     = py_str(tw$rawContent),
     reply_count      = rep,
@@ -69,21 +67,23 @@ tweet_to_list <- function(tw, user) {
     bookmarked_count = bok,
     view_count       = view,
     date             = py_str(tw$date),
-is_quote   = !is.null(py_to_r(tw$quotedTweet)),
-is_retweet = !is.null(py_to_r(tw$retweetedTweet)),
+    is_quote   = !is.null(py_to_r(tw$quotedTweet)),
+    is_retweet = !is.null(py_to_r(tw$retweetedTweet)),
     engagement_rate  = er
   )
 }
 
-# empty tibble template (correct columns, zero rows)
+# empty tibble template ----------------------------------------
 empty_df <- tibble::tibble(
-  username=character(), tweet_id=character(), user_id=character(), text=character(),
-  reply_count=integer(), retweet_count=integer(), like_count=integer(), quote_count=integer(),
-  bookmarked_count=integer(), view_count=numeric(), date=character(),
-  is_quote=logical(), is_retweet=logical(), engagement_rate=numeric()
+  username=character(), tweet_id=character(), tweet_url=character(),
+  user_id=character(), text=character(),
+  reply_count=integer(), retweet_count=integer(), like_count=integer(),
+  quote_count=integer(), bookmarked_count=integer(), view_count=numeric(),
+  date=character(), is_quote=logical(), is_retweet=logical(),
+  engagement_rate=numeric()
 )
 
-### ▸ follower‑snapshot tibble -----------------------------------
+### follower‑snapshot tibble ------------------------------------
 followers_df <- tibble::tibble(
   username        = character(),
   user_id         = character(),
@@ -91,13 +91,12 @@ followers_df <- tibble::tibble(
   snapshot_time   = as.POSIXct(character())
 )
 
-# ── Block B: scrape_one() ---------------------------------------
+# scrape_one() --------------------------------------------------
 scrape_one <- function(user, limit = 150L) {
   tryCatch({
     info  <- asyncio$run(api$user_by_login(user))
-    me_id <- as_chr(info$id)          # ← owner’s ID (always correct)
+    me_id <- as_chr(info$id)
 
-    # store follower count
     followers_df <<- dplyr::bind_rows(
       followers_df,
       tibble(
@@ -109,38 +108,28 @@ scrape_one <- function(user, limit = 150L) {
     )
 
     tweets <- asyncio$run(
-               twscrape$gather(
-                 api$user_tweets_and_replies(info$id, limit = limit)
-               )
-             )
-
+      twscrape$gather(api$user_tweets_and_replies(info$id, limit = limit))
+    )
     message(sprintf("✅ %s → %d tweets", user, py_len(tweets)))
 
     purrr::map_dfr(
       0:(py_len(tweets) - 1),
       ~ tweet_to_list(tweets$`__getitem__`(.x), user)
     ) |>
-    mutate(main_id = me_id)           # keep owner ID for each row
+    mutate(main_id = me_id)
   }, error = function(e) {
     message(sprintf("❌ %s → %s", user, conditionMessage(e)))
     empty_df
   })
 }
 
-# ── Collect tweets for all handles ------------------------------
 all_tweets <- purrr::map_dfr(handles, scrape_one)
+if (nrow(all_tweets) == 0) stop("No tweets scraped — aborting.")
 
-if (nrow(all_tweets) == 0) {
-  stop("No tweets scraped from any handle — aborting run.")
-}
+all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>%
+  select(-main_id)
 
-# Simple, safe flag adjustment (no lag‑trick needed)
-all_tweets <- all_tweets |>
-  distinct(tweet_id, .keep_all = TRUE) |>
-  dplyr::select(-main_id)
-
-
-## 4 – Supabase connection ---------------------------------------
+## 4 – Supabase connection --------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
 supa_user <- Sys.getenv("SUPABASE_USER")
 supa_pwd  <- Sys.getenv("SUPABASE_PWD")
@@ -156,10 +145,17 @@ con <- DBI::dbConnect(
   sslmode = "require"
 )
 
-## 4a – tweets table ---------------------------------------------
+# ensure tweet_url column exists --------------------------------
+DBI::dbExecute(con, "
+  ALTER TABLE twitter_raw
+  ADD COLUMN IF NOT EXISTS tweet_url text;
+")
+
+# 4a – tweets table --------------------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS twitter_raw (
     tweet_id text PRIMARY KEY,
+    tweet_url text,
     username text, user_id text, text text,
     reply_count integer, retweet_count integer, like_count integer,
     quote_count integer, bookmarked_count integer, view_count bigint,
@@ -178,10 +174,10 @@ DBI::dbExecute(con, "
     ORDER BY tweet_id, date DESC
   )
   INSERT INTO twitter_raw AS t
-    (tweet_id, username, user_id, text, reply_count,
+    (tweet_id, tweet_url, username, user_id, text, reply_count,
      retweet_count, like_count, quote_count, bookmarked_count,
      view_count, date, is_quote, is_retweet, engagement_rate)
-  SELECT tweet_id, username, user_id, text, reply_count,
+  SELECT tweet_id, tweet_url, username, user_id, text, reply_count,
          retweet_count, like_count, quote_count, bookmarked_count,
          view_count, date::timestamptz, is_quote, is_retweet, engagement_rate
   FROM dedup
@@ -197,7 +193,7 @@ DBI::dbExecute(con, "
 
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_twitter_raw;")
 
-## 4b – user_followers table -------------------------------------
+## 4b – user_followers -----------------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS user_followers (
     user_id         text,
@@ -213,6 +209,11 @@ DBI::dbWriteTable(con,
                   value     = followers_df,
                   append    = TRUE,
                   row.names = FALSE)
+
+## 5 – wrap‑up --------------------------------------------------
+DBI::dbDisconnect(con)
+message("✅ Tweets & follower counts upserted at ", Sys.time())
+
 
 ## 5 – wrap‑up ----------------------------------------------------
 DBI::dbDisconnect(con)
