@@ -92,7 +92,7 @@ followers_df <- tibble::tibble(
 )
 
 # scrape_one() --------------------------------------------------
-scrape_one <- function(user, limit = 1500L) {
+scrape_one <- function(user, limit = 150L) {
   tryCatch({
     info  <- asyncio$run(api$user_by_login(user))
     me_id <- as_chr(info$id)
