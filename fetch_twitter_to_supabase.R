@@ -129,6 +129,14 @@ if (nrow(all_tweets) == 0) stop("No tweets scraped — aborting.")
 all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>%
   select(-main_id)
 
+all_tweets <- all_tweets %>%
+  mutate(
+    high_er_flag = (reply_count + retweet_count + like_count +
+                    quote_count + bookmarked_count) > view_count,
+    engagement_rate = if_else(high_er_flag, NA_real_, engagement_rate)
+  )%>% select(-high_er_flag)
+
+
 ## 4 – Supabase connection --------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
 supa_user <- Sys.getenv("SUPABASE_USER")
@@ -220,4 +228,5 @@ message("✅ Tweets & follower counts upserted at ", Sys.time())
 DBI::dbDisconnect(con)
 
 message("✅ Tweets & follower counts upserted at ", Sys.time())
+
 
