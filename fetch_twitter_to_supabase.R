@@ -129,13 +129,89 @@ if (nrow(all_tweets) == 0) stop("No tweets scraped — aborting.")
 all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>%
   select(-main_id)
 
+####################
+
+main_ids <- tibble::tribble(
+  ~username,            ~main_id,
+  "weave_db",           "1206153294680403968",
+  "OdyseeTeam",         "1280241715987660801",
+  "ardriveapp",         "1293193263579635712",
+  "redstone_defi",      "1294053547630362630",
+  "everpay_io",         "1334504432973848577",
+  "decentlandlabs",     "1352388512788656136",
+  "KYVENetwork",        "136377177683878784",
+  "onlyarweave",        "1393171138436534272",
+  "ar_io_network",      "1468980765211955205",
+  "Permaswap",          "1496714415231717380",
+  "communitylabs",      "1548502833401516032",
+  "usewander",          "1559946771115163651",
+  "apus_network",       "1569621659468054528",
+  "fwdresearch",        "1573616135651545088",
+  "perma_dao",          "1595075970309857280",
+  "Copus_io",           "1610731228130312194",
+  "basejumpxyz",        "1612781645588742145",
+  "AnyoneFDN",          "1626376419268784130",
+  "arweaveindia",       "1670147900033343489",
+  "useload",            "1734941279379759105",
+  "protocolland",       "1737805485326401536",
+  "aoTheComputer",      "1750584639385939968",
+  "ArweaveOasis",       "1750723327315030016",
+  "aox_xyz",            "1751903735318720512",
+  "astrousd",           "1761104764899606528",
+  "PerplexFi",          "1775862139980226560",
+  "autonomous_af",      "1777500373378322432",
+  "Liquid_Ops",         "1795772412396507136",
+  "ar_aostore",         "1797632049202794496",
+  "FusionFiPro",        "1865790600462921728",
+  "vela_ventures",      "1869466343000444928",
+  "beaconwallet",       "1879152602681585664",
+  "VentoSwap",          "1889714966321893376",
+  "permawebjournal",    "1901592191065300993",
+  "Botega_AF",          "1902521779161292800",
+  "samecwilliams",      "409642632",
+  "TateBerenbaum",      "801518825690824707",
+  "ArweaveEco",         "892752981736779776"
+)
+
+# tweets_raw is the data frame you showed
+all_tweets <- all_tweets %>%                         # ← your df
+  left_join(main_ids, by = "username") %>%
+  # ── 2. classify rows ──────────────────────────────────────────
+  mutate(
+    is_rt_text = str_detect(text, "^RT @"),
+    
+    tweet_type = case_when(
+      is_rt_text                                   ~ "retweet",
+      user_id == main_id & is_rt_text == FALSE &
+        str_detect(text, "https://t.co")           ~ "quote",      # rough proxy
+      user_id == main_id                           ~ "original",
+      TRUE                                         ~ "other"
+    )
+  )
+
+
 all_tweets <- all_tweets %>%
+  arrange(desc(engagement_rate)) %>%
   mutate(
     high_er_flag = (reply_count + retweet_count + like_count +
                     quote_count + bookmarked_count) > view_count,
-    engagement_rate = if_else(high_er_flag, NA_real_, engagement_rate)
-  )%>% select(-high_er_flag)
+    
+    suspicious_retweet = engagement_rate > 50 & is_retweet,
+    
+    engagement_rate = if_else(
+      high_er_flag | suspicious_retweet,
+      NA_real_,
+      engagement_rate
+    )
+  ) %>%
+  select(  # Keep only the original columns
+    tweet_id, tweet_url, username, user_id, text,
+    reply_count, retweet_count, like_count, quote_count,
+    bookmarked_count, view_count, date,
+    is_quote, is_retweet, engagement_rate
+  )
 
+#############
 
 ## 4 – Supabase connection --------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
@@ -228,5 +304,6 @@ message("✅ Tweets & follower counts upserted at ", Sys.time())
 DBI::dbDisconnect(con)
 
 message("✅ Tweets & follower counts upserted at ", Sys.time())
+
 
 
