@@ -6,7 +6,7 @@
 
 ## 0 – packages --------------------------------------------------
 need <- c("reticulate", "jsonlite", "purrr", "dplyr",
-          "lubridate", "DBI", "RPostgres", "tibble")
+          "lubridate", "DBI", "RPostgres", "tibble","stringr")
 new  <- need[!need %in% rownames(installed.packages())]
 if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
 invisible(lapply(need, library, character.only = TRUE))
@@ -304,6 +304,7 @@ message("✅ Tweets & follower counts upserted at ", Sys.time())
 DBI::dbDisconnect(con)
 
 message("✅ Tweets & follower counts upserted at ", Sys.time())
+
 
 
 
