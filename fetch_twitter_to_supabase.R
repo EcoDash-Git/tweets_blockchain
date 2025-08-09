@@ -133,7 +133,6 @@ all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>%
 
 # tweets_raw is the data frame you showed
 all_tweets <- all_tweets %>%                         # ← your df
-  left_join(main_ids, by = "username") %>%
   # ── 2. classify rows ──────────────────────────────────────────
   mutate(
     is_rt_text = str_detect(text, "^RT @"))
@@ -280,3 +279,4 @@ DBI::dbWriteTable(con,
 # 5 – wrap up ----------------------------------------------------
 DBI::dbDisconnect(con)
 message("✅ Tweets & follower counts upserted at ", Sys.time())
+
