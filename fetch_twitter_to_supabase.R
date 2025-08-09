@@ -92,7 +92,7 @@ followers_df <- tibble::tibble(
 )
 
 # scrape_one() --------------------------------------------------
-scrape_one <- function(user, limit = 150L) {
+scrape_one <- function(user, limit = 100L) {
   tryCatch({
     info  <- asyncio$run(api$user_by_login(user))
     me_id <- as_chr(info$id)
@@ -131,63 +131,12 @@ all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>%
 
 ####################
 
-main_ids <- tibble::tribble(
-  ~username,            ~main_id,
-  "weave_db",           "1206153294680403968",
-  "OdyseeTeam",         "1280241715987660801",
-  "ardriveapp",         "1293193263579635712",
-  "redstone_defi",      "1294053547630362630",
-  "everpay_io",         "1334504432973848577",
-  "decentlandlabs",     "1352388512788656136",
-  "KYVENetwork",        "136377177683878784",
-  "onlyarweave",        "1393171138436534272",
-  "ar_io_network",      "1468980765211955205",
-  "Permaswap",          "1496714415231717380",
-  "communitylabs",      "1548502833401516032",
-  "usewander",          "1559946771115163651",
-  "apus_network",       "1569621659468054528",
-  "fwdresearch",        "1573616135651545088",
-  "perma_dao",          "1595075970309857280",
-  "Copus_io",           "1610731228130312194",
-  "basejumpxyz",        "1612781645588742145",
-  "AnyoneFDN",          "1626376419268784130",
-  "arweaveindia",       "1670147900033343489",
-  "useload",            "1734941279379759105",
-  "protocolland",       "1737805485326401536",
-  "aoTheComputer",      "1750584639385939968",
-  "ArweaveOasis",       "1750723327315030016",
-  "aox_xyz",            "1751903735318720512",
-  "astrousd",           "1761104764899606528",
-  "PerplexFi",          "1775862139980226560",
-  "autonomous_af",      "1777500373378322432",
-  "Liquid_Ops",         "1795772412396507136",
-  "ar_aostore",         "1797632049202794496",
-  "FusionFiPro",        "1865790600462921728",
-  "vela_ventures",      "1869466343000444928",
-  "beaconwallet",       "1879152602681585664",
-  "VentoSwap",          "1889714966321893376",
-  "permawebjournal",    "1901592191065300993",
-  "Botega_AF",          "1902521779161292800",
-  "samecwilliams",      "409642632",
-  "TateBerenbaum",      "801518825690824707",
-  "ArweaveEco",         "892752981736779776"
-)
-
 # tweets_raw is the data frame you showed
 all_tweets <- all_tweets %>%                         # ← your df
   left_join(main_ids, by = "username") %>%
   # ── 2. classify rows ──────────────────────────────────────────
   mutate(
-    is_rt_text = str_detect(text, "^RT @"),
-    
-    tweet_type = case_when(
-      is_rt_text                                   ~ "retweet",
-      user_id == main_id & is_rt_text == FALSE &
-        str_detect(text, "https://t.co")           ~ "quote",      # rough proxy
-      user_id == main_id                           ~ "original",
-      TRUE                                         ~ "other"
-    )
-  )
+    is_rt_text = str_detect(text, "^RT @"))
 
 
 all_tweets <- all_tweets %>%
@@ -229,13 +178,8 @@ con <- DBI::dbConnect(
   sslmode = "require"
 )
 
-# ensure tweet_url column exists --------------------------------
-DBI::dbExecute(con, "
-  ALTER TABLE twitter_raw
-  ADD COLUMN IF NOT EXISTS tweet_url text;
-")
-
-# 4a – tweets table --------------------------------------------
+# 4a – tweets table and migration --------------------------------
+# 0) Ensure the table exists with the right columns (no-op if it already exists)
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS twitter_raw (
     tweet_id text PRIMARY KEY,
@@ -248,6 +192,44 @@ DBI::dbExecute(con, "
   );
 ")
 
+# 1) Ensure tweet_url column exists on old installs
+DBI::dbExecute(con, "
+  ALTER TABLE twitter_raw
+  ADD COLUMN IF NOT EXISTS tweet_url text;
+")
+
+# 2) Drop exact duplicates by tweet_id, keeping the newest by date
+DBI::dbExecute(con, "
+WITH ranked AS (
+  SELECT ctid,
+         ROW_NUMBER() OVER (
+           PARTITION BY tweet_id
+           ORDER BY date DESC NULLS LAST
+         ) AS rn
+  FROM twitter_raw
+)
+DELETE FROM twitter_raw t
+USING ranked r
+WHERE t.ctid = r.ctid AND r.rn > 1;
+")
+
+# 3) Add a primary key on tweet_id if the table was created long ago without one
+DBI::dbExecute(con, "
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM   pg_constraint
+    WHERE  conrelid = 'twitter_raw'::regclass
+       AND contype = 'p'
+  ) THEN
+    ALTER TABLE twitter_raw
+      ADD CONSTRAINT twitter_raw_pkey PRIMARY KEY (tweet_id);
+  END IF;
+END$$;
+")
+
+# 4) Stage new rows and upsert -----------------------------------
 DBI::dbWriteTable(con, "tmp_twitter_raw", all_tweets,
                   temporary = TRUE, overwrite = TRUE)
 
@@ -266,7 +248,7 @@ DBI::dbExecute(con, "
          view_count, date::timestamptz, is_quote, is_retweet, engagement_rate
   FROM dedup
   ON CONFLICT (tweet_id) DO UPDATE SET
-    tweet_url        = EXCLUDED.tweet_url,        
+    tweet_url        = EXCLUDED.tweet_url,
     reply_count      = EXCLUDED.reply_count,
     retweet_count    = EXCLUDED.retweet_count,
     like_count       = EXCLUDED.like_count,
@@ -278,7 +260,7 @@ DBI::dbExecute(con, "
 
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_twitter_raw;")
 
-## 4b – user_followers -----------------------------------------
+# 4b – user_followers -------------------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS user_followers (
     user_id         text,
@@ -295,16 +277,6 @@ DBI::dbWriteTable(con,
                   append    = TRUE,
                   row.names = FALSE)
 
-## 5 – wrap‑up --------------------------------------------------
+# 5 – wrap up ----------------------------------------------------
 DBI::dbDisconnect(con)
 message("✅ Tweets & follower counts upserted at ", Sys.time())
-
-
-## 5 – wrap‑up ----------------------------------------------------
-DBI::dbDisconnect(con)
-
-message("✅ Tweets & follower counts upserted at ", Sys.time())
-
-
-
-
