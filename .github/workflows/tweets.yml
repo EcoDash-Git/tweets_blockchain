@@ -1,9 +1,8 @@
 name: Scrape Tweets to Supabase (All + Priority)
 
 on:
-  # run every hour; we'll gate by CET/CEST hour in the job
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 * * * *'   # hourly trigger; DST-safe gating inside
   workflow_dispatch:
     inputs:
       which_mode:
@@ -16,19 +15,40 @@ on:
         default: '100'
 
 jobs:
+  # 0) Cheap time gate – runs in seconds
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      which: ${{ steps.pick.outputs.which }}   # 'all' | 'priority' | 'none'
+    steps:
+      - id: pick
+        run: |
+          HOUR=$(TZ=Europe/Paris date +%H)
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # manual runs bypass the gate; scrape decided in next job
+            echo "which=manual" >> "$GITHUB_OUTPUT"
+          elif [ "$HOUR" = "04" ]; then
+            echo "which=all" >> "$GITHUB_OUTPUT"
+          elif [ "$HOUR" = "13" ]; then
+            echo "which=priority" >> "$GITHUB_OUTPUT"
+          else
+            echo "which=none" >> "$GITHUB_OUTPUT"
+          fi
+          echo "CET/CEST hour is $HOUR → ${{ steps.pick.outputs.which }}"
+  
+  # 1) Scrape only when the gate says so
   scrape:
+    needs: gate
+    if: ${{ needs.gate.outputs.which != 'none' }}
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout repository
       - uses: actions/checkout@v4
 
-      # 2) Install R
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: '4.3'
 
-      # 3) System libraries for R packages that need compilation
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -37,58 +57,50 @@ jobs:
             libcurl4-openssl-dev libxml2-dev \
             python3-dev python3-venv libpng-dev zlib1g-dev
 
-      # 4) Python for reticulate / twscrape
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 5) Figure out CET/CEST hour for gating
-      - id: cethour
-        name: Get CET/CEST hour
-        run: echo "hour=$(TZ=Europe/Paris date +%H)" >> $GITHUB_OUTPUT
-
-      # 6a) Scheduled run — ALL handles at 04:00 CET/CEST
-      - name: Run scraper (ALL @ 04:00 CET/CEST)
-        if: ${{ github.event_name == 'schedule' && steps.cethour.outputs.hour == '04' }}
+      - name: Run scraper
         env:
-          # ---- Supabase (secrets) ----
+          # Supabase
           SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
           SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
           SUPABASE_DB:     ${{ secrets.SUPABASE_DB }}
           SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
           SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
-          # ---- Twitter cookies (secret) ----
+          # Cookies
           TW_COOKIES_JSON: ${{ secrets.TW_COOKIES_JSON }}
-          # ---- Handles (repo variable or leave default in R) ----
-          TW_HANDLES:      ${{ vars.TW_HANDLES }}
-          # ---- Priority list (repo variable or leave default in R) ----
-          TW_PRIORITY_HANDLES: ${{ vars.TW_PRIORITY_HANDLES }}
-          # ---- R script controls ----
-          SCRAPE_MODE:     "all"
-          TWEET_LIMIT:     "100"
-          PY_VENV_PATH:    ".venv"
+          # Lists (optionally repo vars)
+          TW_HANDLES:           ${{ vars.TW_HANDLES }}
+          TW_PRIORITY_HANDLES:  ${{ vars.TW_PRIORITY_HANDLES }}
+          # Mode & limits
+          SCRAPE_MODE: >-
+            ${{ fromJSON('{"all":"all","priority":"priority","manual":"all"}')[needs.gate.outputs.which] }}
+          TWEET_LIMIT: "100"
+          PY_VENV_PATH: ".venv"
         run: Rscript fetch_twitter_to_supabase.R
 
-      # 6b) Scheduled run — PRIORITY handles at 13:00 CET/CEST
-      - name: Run scraper (PRIORITY @ 13:00 CET/CEST)
-        if: ${{ github.event_name == 'schedule' && steps.cethour.outputs.hour == '13' }}
-        env:
-          SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
-          SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
-          SUPABASE_DB:     ${{ secrets.SUPABASE_DB }}
-          SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
-          SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
-          TW_COOKIES_JSON: ${{ secrets.TW_COOKIES_JSON }}
-          TW_HANDLES:      ${{ vars.TW_HANDLES }}
-          TW_PRIORITY_HANDLES: ${{ vars.TW_PRIORITY_HANDLES }}
-          SCRAPE_MODE:     "priority"
-          TWEET_LIMIT:     "100"
-          PY_VENV_PATH:    ".venv"
-        run: Rscript fetch_twitter_to_supabase.R
-
-      # 6c) Manual run — choose mode from the UI
+  # 2) Optional job for manual runs (kept separate so gate job stays clean)
+  manual:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.3'
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpq-dev libssl-dev \
+            libcurl4-openssl-dev libxml2-dev \
+            python3-dev python3-venv libpng-dev zlib1g-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Run scraper (manual)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
           SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
@@ -96,8 +108,8 @@ jobs:
           SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
           SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
           TW_COOKIES_JSON: ${{ secrets.TW_COOKIES_JSON }}
-          TW_HANDLES:      ${{ vars.TW_HANDLES }}
-          TW_PRIORITY_HANDLES: ${{ vars.TW_PRIORITY_HANDLES }}
+          TW_HANDLES:           ${{ vars.TW_HANDLES }}
+          TW_PRIORITY_HANDLES:  ${{ vars.TW_PRIORITY_HANDLES }}
           SCRAPE_MODE:     ${{ inputs.which_mode }}
           TWEET_LIMIT:     ${{ inputs.tweet_limit }}
           PY_VENV_PATH:    ".venv"
