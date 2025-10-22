@@ -2,11 +2,14 @@
 # ---------------------------------------------------------------
 #  Scrape tweets for a set of handles and upsert into Supabase,
 #  plus snapshot follower counts to user_followers.
+#  Modes:
+#    - SCRAPE_MODE=all       → uses TW_HANDLES
+#    - SCRAPE_MODE=priority  → uses TW_PRIORITY_HANDLES
 # ---------------------------------------------------------------
 
 ## 0 – packages --------------------------------------------------
 need <- c("reticulate", "jsonlite", "purrr", "dplyr",
-          "lubridate", "DBI", "RPostgres", "tibble","stringr")
+          "lubridate", "DBI", "RPostgres", "tibble", "stringr")
 new  <- need[!need %in% rownames(installed.packages())]
 if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
 invisible(lapply(need, library, character.only = TRUE))
@@ -35,13 +38,41 @@ asyncio$run(api$pool$add_account("x", "x", "x", "x", cookies = cookies_str))
 message(sprintf("✅ %d cookies loaded, total chars = %d",
                 nrow(cookies_list), nchar(cookies_str)))
 
-## 3 – scrape ----------------------------------------------------
-handles <- trimws(strsplit(
-            Sys.getenv("TW_HANDLES",
-                       "aoTheComputer,ar_io_network,samecwilliams"), ","
-          )[[1]])
+## 3 – Which handles to scrape? ---------------------------------
+# Mode: all (default) or priority
+SCRAPE_MODE <- tolower(Sys.getenv("SCRAPE_MODE", "all"))
+
+# Comma-separated lists; leading @ are stripped
+clean_list <- function(x) {
+  if (is.null(x) || x == "") return(character())
+  unlist(strsplit(x, ",")) |>
+    trimws() |>
+    sub("^@", "", x = _) |>
+    unique()
+}
+
+all_handles_env <- Sys.getenv(
+  "TW_HANDLES",
+  # put your "all" default list here if you want a fallback:
+  "aoTheComputer,ar_io_network,samecwilliams"
+)
+priority_handles_env <- Sys.getenv(
+  "TW_PRIORITY_HANDLES",
+  # default to the three priority accounts if not set
+  "HyMatrixOrg,outprog,EverVisionLabs"
+)
+
+handles <- if (SCRAPE_MODE == "priority") {
+  clean_list(priority_handles_env)
+} else {
+  clean_list(all_handles_env)
+}
+
+if (length(handles) == 0) stop("No handles found to scrape.")
+message("🛠  Mode: ", SCRAPE_MODE)
 message("✅ Handles: ", paste(handles, collapse = ", "))
 
+## Helpers to safely pull Python attrs --------------------------
 py_none <- import_builtins()$None
 as_chr  <- function(x) if (!identical(x, py_none)) py_str(x) else NA_character_
 as_num  <- function(x) if (!identical(x, py_none)) as.numeric(py_str(x)) else NA_real_
@@ -57,7 +88,7 @@ tweet_to_list <- function(tw, user) {
   list(
     username = user,
     tweet_id = id_str,
-    tweet_url = url_str,                # ← NEW COLUMN
+    tweet_url = url_str,
     user_id  = as_chr(tw$user$id),
     text     = py_str(tw$rawContent),
     reply_count      = rep,
@@ -73,7 +104,7 @@ tweet_to_list <- function(tw, user) {
   )
 }
 
-# empty tibble template ----------------------------------------
+# empty tibble templates ----------------------------------------
 empty_df <- tibble::tibble(
   username=character(), tweet_id=character(), tweet_url=character(),
   user_id=character(), text=character(),
@@ -83,7 +114,6 @@ empty_df <- tibble::tibble(
   engagement_rate=numeric()
 )
 
-### follower‑snapshot tibble ------------------------------------
 followers_df <- tibble::tibble(
   username        = character(),
   user_id         = character(),
@@ -91,8 +121,11 @@ followers_df <- tibble::tibble(
   snapshot_time   = as.POSIXct(character())
 )
 
-# scrape_one() --------------------------------------------------
-scrape_one <- function(user, limit = 100L) {
+# per-user scrape ------------------------------------------------
+# Optional: limit via env TWEET_LIMIT (default 100)
+TWEET_LIMIT <- as.integer(Sys.getenv("TWEET_LIMIT", "100"))
+
+scrape_one <- function(user, limit = TWEET_LIMIT) {
   tryCatch({
     info  <- asyncio$run(api$user_by_login(user))
     me_id <- as_chr(info$id)
@@ -113,7 +146,7 @@ scrape_one <- function(user, limit = 100L) {
     message(sprintf("✅ %s → %d tweets", user, py_len(tweets)))
 
     purrr::map_dfr(
-      0:(py_len(tweets) - 1),
+      0:(max(0, py_len(tweets) - 1)),
       ~ tweet_to_list(tweets$`__getitem__`(.x), user)
     ) |>
     mutate(main_id = me_id)
@@ -126,40 +159,29 @@ scrape_one <- function(user, limit = 100L) {
 all_tweets <- purrr::map_dfr(handles, scrape_one)
 if (nrow(all_tweets) == 0) stop("No tweets scraped — aborting.")
 
-all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>%
-  select(-main_id)
+# de-dup & light hygiene ----------------------------------------
+all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>% select(-main_id)
 
-####################
-
-# tweets_raw is the data frame you showed
-all_tweets <- all_tweets %>%                         # ← your df
-  # ── 2. classify rows ──────────────────────────────────────────
-  mutate(
-    is_rt_text = str_detect(text, "^RT @"))
-
-
+# classify & guard ER outliers ----------------------------------
 all_tweets <- all_tweets %>%
+  mutate(is_rt_text = str_detect(text, "^RT @")) %>%
   arrange(desc(engagement_rate)) %>%
   mutate(
     high_er_flag = (reply_count + retweet_count + like_count +
                     quote_count + bookmarked_count) > view_count,
-    
     suspicious_retweet = engagement_rate > 50 & is_retweet,
-    
     engagement_rate = if_else(
       high_er_flag | suspicious_retweet,
       NA_real_,
       engagement_rate
     )
   ) %>%
-  select(  # Keep only the original columns
+  select(
     tweet_id, tweet_url, username, user_id, text,
     reply_count, retweet_count, like_count, quote_count,
     bookmarked_count, view_count, date,
     is_quote, is_retweet, engagement_rate
   )
-
-#############
 
 ## 4 – Supabase connection --------------------------------------
 supa_host <- Sys.getenv("SUPABASE_HOST")
@@ -177,8 +199,7 @@ con <- DBI::dbConnect(
   sslmode = "require"
 )
 
-# 4a – tweets table and migration --------------------------------
-# 0) Ensure the table exists with the right columns (no-op if it already exists)
+# 4a – tweets table & migration --------------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS twitter_raw (
     tweet_id text PRIMARY KEY,
@@ -191,13 +212,11 @@ DBI::dbExecute(con, "
   );
 ")
 
-# 1) Ensure tweet_url column exists on old installs
 DBI::dbExecute(con, "
   ALTER TABLE twitter_raw
   ADD COLUMN IF NOT EXISTS tweet_url text;
 ")
 
-# 2) Drop exact duplicates by tweet_id, keeping the newest by date
 DBI::dbExecute(con, "
 WITH ranked AS (
   SELECT ctid,
@@ -212,7 +231,6 @@ USING ranked r
 WHERE t.ctid = r.ctid AND r.rn > 1;
 ")
 
-# 3) Add a primary key on tweet_id if the table was created long ago without one
 DBI::dbExecute(con, "
 DO $$
 BEGIN
@@ -228,7 +246,6 @@ BEGIN
 END$$;
 ")
 
-# 4) Stage new rows and upsert -----------------------------------
 DBI::dbWriteTable(con, "tmp_twitter_raw", all_tweets,
                   temporary = TRUE, overwrite = TRUE)
 
@@ -278,5 +295,6 @@ DBI::dbWriteTable(con,
 
 # 5 – wrap up ----------------------------------------------------
 DBI::dbDisconnect(con)
-message("✅ Tweets & follower counts upserted at ", Sys.time())
+message(sprintf("✅ (%s) Tweets & follower counts upserted at %s",
+                SCRAPE_MODE, as.character(Sys.time())))
 
