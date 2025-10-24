@@ -2,7 +2,7 @@ name: Scrape Tweets to Supabase (All + Priority)
 
 on:
   schedule:
-    - cron: '0 * * * *'   # hourly trigger; DST-safe gating inside
+    - cron: '0 * * * *'   # hourly; we gate inside
   workflow_dispatch:
     inputs:
       which_mode:
@@ -14,8 +14,12 @@ on:
         required: false
         default: '100'
 
+concurrency:
+  group: scrape-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # 0) Cheap time gate – runs in seconds
+  # 0) Time/mode gate
   gate:
     runs-on: ubuntu-latest
     outputs:
@@ -23,23 +27,24 @@ jobs:
     steps:
       - id: pick
         run: |
-          HOUR=$(TZ=Europe/Paris date +%H)
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            # manual runs bypass the gate; scrape decided in next job
-            echo "which=manual" >> "$GITHUB_OUTPUT"
-          elif [ "$HOUR" = "04" ]; then
-            echo "which=all" >> "$GITHUB_OUTPUT"
-          elif [ "$HOUR" = "13" ]; then
-            echo "which=priority" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Pass through the manual choice so ONLY the scrape job runs
+            echo "which=${{ inputs.which_mode }}" >> "$GITHUB_OUTPUT"
           else
-            echo "which=none" >> "$GITHUB_OUTPUT"
+            HOUR=$(TZ=Europe/Paris date +%H)
+            if [ "$HOUR" = "04" ]; then
+              echo "which=all" >> "$GITHUB_OUTPUT"
+            elif [ "$HOUR" = "13" ]; then
+              echo "which=priority" >> "$GITHUB_OUTPUT"
+            else
+              echo "which=none" >> "$GITHUB_OUTPUT"
+            fi
           fi
-          echo "CET/CEST hour is $HOUR → ${{ steps.pick.outputs.which }}"
-  
-  # 1) Scrape only when the gate says so
+
+  # 1) Scrape only once (no separate manual job)
   scrape:
     needs: gate
-    if: ${{ needs.gate.outputs.which != 'none' }}
+    if: ${{ needs.gate.outputs.which == 'all' || needs.gate.outputs.which == 'priority' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -71,46 +76,11 @@ jobs:
           SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
           # Cookies
           TW_COOKIES_JSON: ${{ secrets.TW_COOKIES_JSON }}
-          # Lists (optionally repo vars)
+          # Lists (repo variables)
           TW_HANDLES:           ${{ vars.TW_HANDLES }}
           TW_PRIORITY_HANDLES:  ${{ vars.TW_PRIORITY_HANDLES }}
           # Mode & limits
-          SCRAPE_MODE: >-
-            ${{ fromJSON('{"all":"all","priority":"priority","manual":"all"}')[needs.gate.outputs.which] }}
-          TWEET_LIMIT: "100"
+          SCRAPE_MODE:          ${{ needs.gate.outputs.which }}   # all | priority
+          TWEET_LIMIT:          ${{ inputs.tweet_limit || '100' }}
           PY_VENV_PATH: ".venv"
-        run: Rscript fetch_twitter_to_supabase.R
-
-  # 2) Optional job for manual runs (kept separate so gate job stays clean)
-  manual:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: '4.3'
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential libpq-dev libssl-dev \
-            libcurl4-openssl-dev libxml2-dev \
-            python3-dev python3-venv libpng-dev zlib1g-dev
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Run scraper (manual)
-        env:
-          SUPABASE_HOST:   ${{ secrets.SUPABASE_HOST }}
-          SUPABASE_PORT:   ${{ secrets.SUPABASE_PORT }}
-          SUPABASE_DB:     ${{ secrets.SUPABASE_DB }}
-          SUPABASE_USER:   ${{ secrets.SUPABASE_USER }}
-          SUPABASE_PWD:    ${{ secrets.SUPABASE_PWD }}
-          TW_COOKIES_JSON: ${{ secrets.TW_COOKIES_JSON }}
-          TW_HANDLES:           ${{ vars.TW_HANDLES }}
-          TW_PRIORITY_HANDLES:  ${{ vars.TW_PRIORITY_HANDLES }}
-          SCRAPE_MODE:     ${{ inputs.which_mode }}
-          TWEET_LIMIT:     ${{ inputs.tweet_limit }}
-          PY_VENV_PATH:    ".venv"
         run: Rscript fetch_twitter_to_supabase.R
