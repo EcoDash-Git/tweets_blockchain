@@ -3,8 +3,11 @@
 #  Scrape tweets for a set of handles and upsert into Supabase,
 #  plus snapshot follower counts to user_followers.
 #  Modes:
-#    - SCRAPE_MODE=all       → uses TW_HANDLES
-#    - SCRAPE_MODE=priority  → uses TW_PRIORITY_HANDLES
+#    - SCRAPE_MODE=all       → uses tw_handles.txt (fallback: TW_HANDLES)
+#    - SCRAPE_MODE=priority  → uses tw_priority_handles.txt (fallback: TW_PRIORITY_HANDLES)
+#  Notes:
+#    • Each file: one handle or numeric ID per line. Lines may start with @.
+#    • Blank lines and anything after '#' on a line are ignored.
 # ---------------------------------------------------------------
 
 ## 0 – packages --------------------------------------------------
@@ -38,12 +41,32 @@ asyncio$run(api$pool$add_account("x", "x", "x", "x", cookies = cookies_str))
 message(sprintf("✅ %d cookies loaded, total chars = %d",
                 nrow(cookies_list), nchar(cookies_str)))
 
-## 3 – Which handles to scrape? ---------------------------------
+## 3 – Which handles to scrape?  (FILES + env fallback) ----------
 # Mode: all (default) or priority
 SCRAPE_MODE <- tolower(Sys.getenv("SCRAPE_MODE", "all"))
 
-# Comma-separated lists; leading @ are stripped
-clean_list <- function(x) {
+# Read newline-delimited list; allow @usernames, strip comments, commas split
+read_list_file <- function(path) {
+  if (!file.exists(path)) return(character())
+  ln <- readLines(path, warn = FALSE, encoding = "UTF-8")
+  ln |>
+    sub("#.*$", "", x = _) |>
+    trimws() |>
+    (\(v) unlist(strsplit(v, ",")))() |>
+    trimws() |>
+    sub("^@", "", x = _) |>
+    (\(v) v[nzchar(v)])() |>
+    unique()
+}
+
+# Prefer repo files; fall back to envs if files missing/empty
+handles_all_file      <- "tw_handles.txt"
+handles_priority_file <- "tw_priority_handles.txt"
+
+file_all      <- read_list_file(handles_all_file)
+file_priority <- read_list_file(handles_priority_file)
+
+clean_env <- function(x) {
   if (is.null(x) || x == "") return(character())
   unlist(strsplit(x, ",")) |>
     trimws() |>
@@ -51,26 +74,25 @@ clean_list <- function(x) {
     unique()
 }
 
-all_handles_env <- Sys.getenv(
-  "TW_HANDLES",
-  # put your "all" default list here if you want a fallback:
-  "aoTheComputer,ar_io_network,samecwilliams"
-)
-priority_handles_env <- Sys.getenv(
-  "TW_PRIORITY_HANDLES",
-  # default to the three priority accounts if not set
-  "HyMatrixOrg,outprog,EverVisionLabs"
-)
+env_all <- Sys.getenv("TW_HANDLES", "aoTheComputer,ar_io_network,samecwilliams")
+env_pri <- Sys.getenv("TW_PRIORITY_HANDLES", "HyMatrixOrg,outprog,EverVisionLabs")
 
-handles <- if (SCRAPE_MODE == "priority") {
-  clean_list(priority_handles_env)
-} else {
-  clean_list(all_handles_env)
-}
+handles_all      <- if (length(file_all)) file_all else clean_env(env_all)
+handles_priority <- if (length(file_priority)) file_priority else clean_env(env_pri)
 
-if (length(handles) == 0) stop("No handles found to scrape.")
+handles <- if (SCRAPE_MODE == "priority") handles_priority else handles_all
+
+if (length(handles) == 0) stop("No handles found to scrape (files and env were empty).")
 message("🛠  Mode: ", SCRAPE_MODE)
-message("✅ Handles: ", paste(handles, collapse = ", "))
+message("✅ Handles source: ", if (SCRAPE_MODE == "priority") {
+  if (length(file_priority)) "tw_priority_handles.txt" else "TW_PRIORITY_HANDLES env"
+} else {
+  if (length(file_all)) "tw_handles.txt" else "TW_HANDLES env"
+})
+message("✅ Targets: ", paste(handles, collapse = ", "))
+
+# Helper: detect numeric ID vs username
+is_numeric_id <- function(x) grepl("^[0-9]{5,}$", x)
 
 ## Helpers to safely pull Python attrs --------------------------
 py_none <- import_builtins()$None
@@ -121,62 +143,76 @@ followers_df <- tibble::tibble(
   snapshot_time   = as.POSIXct(character())
 )
 
-# per-user scrape ------------------------------------------------
 # Optional: limit via env TWEET_LIMIT (default 100)
 TWEET_LIMIT <- as.integer(Sys.getenv("TWEET_LIMIT", "100"))
 
-scrape_one <- function(user, limit = TWEET_LIMIT) {
+## scrape_one() accepts username OR numeric ID ------------------
+scrape_one <- function(user_or_id, limit = TWEET_LIMIT) {
   tryCatch({
-    info  <- asyncio$run(api$user_by_login(user))
-    me_id <- as_chr(info$id)
+    if (is_numeric_id(user_or_id)) {
+      # numeric ID path
+      info  <- asyncio$run(api$user_by_id(user_or_id))
+      login <- as_chr(info$login)    # screen name
+      me_id <- as_chr(info$id)       # numeric ID
+    } else {
+      # username path
+      info  <- asyncio$run(api$user_by_login(user_or_id))
+      login <- user_or_id
+      me_id <- as_chr(info$id)
+    }
 
+    # snapshot followers
     followers_df <<- dplyr::bind_rows(
       followers_df,
       tibble(
-        username        = user,
+        username        = login,
         user_id         = me_id,
         followers_count = as_num(info$followersCount),
         snapshot_time   = Sys.time()
       )
     )
 
+    # fetch tweets by ID (works for both paths)
     tweets <- asyncio$run(
       twscrape$gather(api$user_tweets_and_replies(info$id, limit = limit))
     )
-    message(sprintf("✅ %s → %d tweets", user, py_len(tweets)))
+    message(sprintf("✅ %s → %d tweets", login, py_len(tweets)))
 
     purrr::map_dfr(
       0:(max(0, py_len(tweets) - 1)),
-      ~ tweet_to_list(tweets$`__getitem__`(.x), user)
+      ~ tweet_to_list(tweets$`__getitem__`(.x), login)
     ) |>
-    mutate(main_id = me_id)
+      dplyr::mutate(main_id = me_id)
   }, error = function(e) {
-    message(sprintf("❌ %s → %s", user, conditionMessage(e)))
+    message(sprintf("❌ %s → %s", user_or_id, conditionMessage(e)))
     empty_df
   })
 }
 
+## scrape all targets -------------------------------------------
 all_tweets <- purrr::map_dfr(handles, scrape_one)
 if (nrow(all_tweets) == 0) stop("No tweets scraped — aborting.")
 
 # de-dup & light hygiene ----------------------------------------
-all_tweets <- all_tweets %>% distinct(tweet_id, .keep_all = TRUE) %>% select(-main_id)
+all_tweets <- all_tweets %>%
+  dplyr::distinct(tweet_id, .keep_all = TRUE) %>%
+  dplyr::select(-main_id)
 
 # classify & guard ER outliers ----------------------------------
 all_tweets <- all_tweets %>%
-  mutate(is_rt_text = str_detect(text, "^RT @")) %>%
-  arrange(desc(engagement_rate)) %>%
-  mutate(
+  dplyr::mutate(is_rt_text = stringr::str_detect(text, "^RT @")) %>%
+  dplyr::arrange(dplyr::desc(engagement_rate)) %>%
+  dplyr::mutate(
     high_er_flag = (reply_count + retweet_count + like_count +
                     quote_count + bookmarked_count) > view_count,
     suspicious_retweet = engagement_rate > 50 & is_retweet,
-    engagement_rate = if_else(
+    engagement_rate = dplyr::if_else(
       high_er_flag | suspicious_retweet,
       NA_real_,
       engagement_rate
     )
   ) %>%
-  select(
+  dplyr::select(
     tweet_id, tweet_url, username, user_id, text,
     reply_count, retweet_count, like_count, quote_count,
     bookmarked_count, view_count, date,
@@ -297,4 +333,3 @@ DBI::dbWriteTable(con,
 DBI::dbDisconnect(con)
 message(sprintf("✅ (%s) Tweets & follower counts upserted at %s",
                 SCRAPE_MODE, as.character(Sys.time())))
-
