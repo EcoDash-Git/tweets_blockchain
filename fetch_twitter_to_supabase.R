@@ -99,19 +99,34 @@ py_none <- import_builtins()$None
 as_chr  <- function(x) if (!identical(x, py_none)) py_str(x) else NA_character_
 as_num  <- function(x) if (!identical(x, py_none)) as.numeric(py_str(x)) else NA_real_
 
+# ───────────────────────────────────────────────────────────────
+# ✅ MODIFIED: canonical tweet URL uses the author's current handle
+# ───────────────────────────────────────────────────────────────
 tweet_to_list <- function(tw, user) {
+  # author (true owner of the tweet)
+  author_login <- as_chr(tw$user$login)  # e.g., "SpencerProphet"
+  author_id    <- as_chr(tw$user$id)
+
   view <- as_num(tw$viewCount); rep <- as_num(tw$replyCount)
   rt   <- as_num(tw$retweetCount); like <- as_num(tw$likeCount)
   quo  <- as_num(tw$quoteCount);   bok  <- as_num(tw$bookmarkedCount)
   er   <- if (!is.na(view) && view > 0) 100*(rep+rt+like+quo+bok)/view else NA
+
   id_str  <- py_str(tw$id)
-  url_str <- sprintf("https://twitter.com/%s/status/%s", user, id_str)
+
+  # Canonical URL points to the author's current handle
+  url_str <- sprintf("https://twitter.com/%s/status/%s", author_login, id_str)
 
   list(
+    # keep the scraped target account for lineage
     username = user,
-    tweet_id = id_str,
+
+    # tweet identity + canonical link
+    tweet_id  = id_str,
     tweet_url = url_str,
-    user_id  = as_chr(tw$user$id),
+
+    # metrics & content
+    user_id  = author_id,                # author's numeric ID
     text     = py_str(tw$rawContent),
     reply_count      = rep,
     retweet_count    = rt,
@@ -120,8 +135,8 @@ tweet_to_list <- function(tw, user) {
     bookmarked_count = bok,
     view_count       = view,
     date             = py_str(tw$date),
-    is_quote   = !is.null(py_to_r(tw$quotedTweet)),
-    is_retweet = !is.null(py_to_r(tw$retweetedTweet)),
+    is_quote         = !is.null(py_to_r(tw$quotedTweet)),
+    is_retweet       = !is.null(py_to_r(tw$retweetedTweet)),
     engagement_rate  = er
   )
 }
@@ -333,3 +348,5 @@ DBI::dbWriteTable(con,
 DBI::dbDisconnect(con)
 message(sprintf("✅ (%s) Tweets & follower counts upserted at %s",
                 SCRAPE_MODE, as.character(Sys.time())))
+
+
