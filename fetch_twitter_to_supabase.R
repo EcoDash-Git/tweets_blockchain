@@ -99,13 +99,25 @@ py_none <- import_builtins()$None
 as_chr  <- function(x) if (!identical(x, py_none)) py_str(x) else NA_character_
 as_num  <- function(x) if (!identical(x, py_none)) as.numeric(py_str(x)) else NA_real_
 
+# Try multiple attribute names in order; return first non-None as character
+py_attr_first <- function(obj, candidates) {
+  for (nm in candidates) {
+    if (py_has_attr(obj, nm)) {
+      val <- obj[[nm]]
+      ch  <- as_chr(val)
+      if (!is.na(ch) && nzchar(ch)) return(ch)
+    }
+  }
+  NA_character_
+}
+
 # ───────────────────────────────────────────────────────────────
-# ✅ MODIFIED: canonical tweet URL uses the author's current handle
+# Canonical tweet URL uses the author's current handle
 # ───────────────────────────────────────────────────────────────
-tweet_to_list <- function(tw, user) {
+tweet_to_list <- function(tw, timeline_owner_handle) {
   # author (true owner of the tweet)
-  author_login <- as_chr(tw$user$login)  # e.g., "SpencerProphet"
-  author_id    <- as_chr(tw$user$id)
+  author_handle <- py_attr_first(tw$user, c("username", "login", "screen_name"))
+  author_id     <- py_attr_first(tw$user, c("id", "rest_id"))
 
   view <- as_num(tw$viewCount); rep <- as_num(tw$replyCount)
   rt   <- as_num(tw$retweetCount); like <- as_num(tw$likeCount)
@@ -114,20 +126,16 @@ tweet_to_list <- function(tw, user) {
 
   id_str  <- py_str(tw$id)
 
-  # Canonical URL points to the author's current handle
-  url_str <- sprintf("https://twitter.com/%s/status/%s", author_login, id_str)
+  # Fallback: if author_handle unknown, keep the timeline owner for URL
+  handle_for_url <- if (!is.na(author_handle) && nzchar(author_handle)) author_handle else timeline_owner_handle
+  url_str <- sprintf("https://twitter.com/%s/status/%s", handle_for_url, id_str)
 
   list(
-    # keep the scraped target account for lineage
-    username = user,
-
-    # tweet identity + canonical link
+    username = timeline_owner_handle,     # the account whose timeline we scraped
     tweet_id  = id_str,
     tweet_url = url_str,
-
-    # metrics & content
-    user_id  = author_id,                # author's numeric ID
-    text     = py_str(tw$rawContent),
+    user_id   = author_id,                # author's numeric id (string)
+    text      = py_str(tw$rawContent),
     reply_count      = rep,
     retweet_count    = rt,
     like_count       = like,
@@ -165,24 +173,25 @@ TWEET_LIMIT <- as.integer(Sys.getenv("TWEET_LIMIT", "100"))
 scrape_one <- function(user_or_id, limit = TWEET_LIMIT) {
   tryCatch({
     if (is_numeric_id(user_or_id)) {
-      # numeric ID path
       info  <- asyncio$run(api$user_by_id(user_or_id))
-      login <- as_chr(info$login)    # screen name
-      me_id <- as_chr(info$id)       # numeric ID
+      login <- py_attr_first(info, c("username", "login", "screen_name"))
+      me_id <- py_attr_first(info, c("id", "rest_id"))
     } else {
-      # username path
       info  <- asyncio$run(api$user_by_login(user_or_id))
-      login <- user_or_id
-      me_id <- as_chr(info$id)
+      login_from_api <- py_attr_first(info, c("username", "login", "screen_name"))
+      login <- if (!is.na(login_from_api) && nzchar(login_from_api)) login_from_api else user_or_id
+      me_id <- py_attr_first(info, c("id", "rest_id"))
     }
 
-    # snapshot followers
+    # snapshot followers (guard if followersCount missing)
+    followers_cnt <- as_num(if (py_has_attr(info, "followersCount")) info$followersCount else py_none)
+
     followers_df <<- dplyr::bind_rows(
       followers_df,
       tibble(
         username        = login,
         user_id         = me_id,
-        followers_count = as_num(info$followersCount),
+        followers_count = followers_cnt,
         snapshot_time   = Sys.time()
       )
     )
@@ -348,5 +357,3 @@ DBI::dbWriteTable(con,
 DBI::dbDisconnect(con)
 message(sprintf("✅ (%s) Tweets & follower counts upserted at %s",
                 SCRAPE_MODE, as.character(Sys.time())))
-
-
