@@ -42,10 +42,8 @@ message(sprintf("✅ %d cookies loaded, total chars = %d",
                 nrow(cookies_list), nchar(cookies_str)))
 
 ## 3 – Which handles to scrape?  (FILES + env fallback) ----------
-# Mode: all (default) or priority
 SCRAPE_MODE <- tolower(Sys.getenv("SCRAPE_MODE", "all"))
 
-# Read newline-delimited list; allow @usernames, strip comments, commas split
 read_list_file <- function(path) {
   if (!file.exists(path)) return(character())
   ln <- readLines(path, warn = FALSE, encoding = "UTF-8")
@@ -59,7 +57,6 @@ read_list_file <- function(path) {
     unique()
 }
 
-# Prefer repo files; fall back to envs if files missing/empty
 handles_all_file      <- "tw_handles.txt"
 handles_priority_file <- "tw_priority_handles.txt"
 
@@ -99,7 +96,6 @@ py_none <- import_builtins()$None
 as_chr  <- function(x) if (!identical(x, py_none)) py_str(x) else NA_character_
 as_num  <- function(x) if (!identical(x, py_none)) as.numeric(py_str(x)) else NA_real_
 
-# Try multiple attribute names in order; return first non-None as character
 py_attr_first <- function(obj, candidates) {
   for (nm in candidates) {
     if (py_has_attr(obj, nm)) {
@@ -115,7 +111,6 @@ py_attr_first <- function(obj, candidates) {
 # Canonical tweet URL uses the author's current handle
 # ───────────────────────────────────────────────────────────────
 tweet_to_list <- function(tw, timeline_owner_handle) {
-  # author (true owner of the tweet)
   author_handle <- py_attr_first(tw$user, c("username", "login", "screen_name"))
   author_id     <- py_attr_first(tw$user, c("id", "rest_id"))
 
@@ -125,16 +120,14 @@ tweet_to_list <- function(tw, timeline_owner_handle) {
   er   <- if (!is.na(view) && view > 0) 100*(rep+rt+like+quo+bok)/view else NA
 
   id_str  <- py_str(tw$id)
-
-  # Fallback: if author_handle unknown, keep the timeline owner for URL
   handle_for_url <- if (!is.na(author_handle) && nzchar(author_handle)) author_handle else timeline_owner_handle
   url_str <- sprintf("https://twitter.com/%s/status/%s", handle_for_url, id_str)
 
   list(
-    username = timeline_owner_handle,     # the account whose timeline we scraped
+    username = timeline_owner_handle,   # whose timeline we scraped
     tweet_id  = id_str,
     tweet_url = url_str,
-    user_id   = author_id,                # author's numeric id (string)
+    user_id   = author_id,              # tweet author's numeric id (string)
     text      = py_str(tw$rawContent),
     reply_count      = rep,
     retweet_count    = rt,
@@ -183,14 +176,20 @@ scrape_one <- function(user_or_id, limit = TWEET_LIMIT) {
       me_id <- py_attr_first(info, c("id", "rest_id"))
     }
 
+    # If we still don't have an ID, skip this account entirely
+    if (is.na(me_id) || !nzchar(me_id)) {
+      message(sprintf("⚠️  Skipping %s (no user id returned).", user_or_id))
+      return(empty_df)
+    }
+
     # snapshot followers (guard if followersCount missing)
     followers_cnt <- as_num(if (py_has_attr(info, "followersCount")) info$followersCount else py_none)
 
     followers_df <<- dplyr::bind_rows(
       followers_df,
       tibble(
-        username        = login,
-        user_id         = me_id,
+        username        = as.character(login %||% ""),
+        user_id         = as.character(me_id),
         followers_count = followers_cnt,
         snapshot_time   = Sys.time()
       )
@@ -212,6 +211,8 @@ scrape_one <- function(user_or_id, limit = TWEET_LIMIT) {
     empty_df
   })
 }
+
+`%||%` <- function(x, y) if (is.null(x) || is.na(x) || x == "") y else x
 
 ## scrape all targets -------------------------------------------
 all_tweets <- purrr::map_dfr(handles, scrape_one)
@@ -336,7 +337,7 @@ DBI::dbExecute(con, "
 
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_twitter_raw;")
 
-# 4b – user_followers -------------------------------------------
+# 4b – user_followers (robust write) ----------------------------
 DBI::dbExecute(con, "
   CREATE TABLE IF NOT EXISTS user_followers (
     user_id         text,
@@ -347,13 +348,40 @@ DBI::dbExecute(con, "
   );
 ")
 
-DBI::dbWriteTable(con,
-                  name      = "user_followers",
-                  value     = followers_df,
-                  append    = TRUE,
-                  row.names = FALSE)
+# Clean the R-side frame first: drop rows with missing ids or usernames
+followers_df <- followers_df %>%
+  dplyr::mutate(
+    user_id         = as.character(user_id),
+    username        = as.character(username),
+    followers_count = suppressWarnings(as.numeric(followers_count)),
+    snapshot_time   = as.POSIXct(snapshot_time, tz = \"UTC\")
+  ) %>%
+  dplyr::filter(!is.na(user_id), nzchar(user_id),
+                !is.na(username), nzchar(username))
+
+if (nrow(followers_df) > 0) {
+  DBI::dbWriteTable(con, "tmp_user_followers", followers_df,
+                    temporary = TRUE, overwrite = TRUE)
+
+  # Insert only valid rows; coalesce followers_count to 0; ignore dup PKs
+  DBI::dbExecute(con, "
+    INSERT INTO user_followers (user_id, username, followers_count, snapshot_time)
+    SELECT
+      user_id,
+      username,
+      COALESCE(followers_count, 0)::bigint,
+      snapshot_time::timestamptz
+    FROM tmp_user_followers
+    WHERE user_id IS NOT NULL AND user_id <> '' AND username IS NOT NULL AND username <> ''
+    ON CONFLICT DO NOTHING;
+  ")
+
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_user_followers;")
+} else {
+  message(\"(i) No valid follower snapshots to insert this run.\")
+}
 
 # 5 – wrap up ----------------------------------------------------
 DBI::dbDisconnect(con)
-message(sprintf("✅ (%s) Tweets & follower counts upserted at %s",
+message(sprintf(\"✅ (%s) Tweets & follower counts upserted at %s\",
                 SCRAPE_MODE, as.character(Sys.time())))
