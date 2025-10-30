@@ -246,4 +246,115 @@ dbExecute(con, "
     tweet_id text PRIMARY KEY,
     tweet_url text,
     username text, user_id text, text text,
-    reply
+    reply_count integer, retweet_count integer, like_count integer,
+    quote_count integer, bookmarked_count integer, view_count bigint,
+    date timestamptz, is_quote boolean, is_retweet boolean,
+    engagement_rate numeric
+  );
+")
+
+dbExecute(con, "
+  ALTER TABLE twitter_raw
+  ADD COLUMN IF NOT EXISTS tweet_url text;
+")
+
+dbExecute(con, "
+WITH ranked AS (
+  SELECT ctid,
+         ROW_NUMBER() OVER (PARTITION BY tweet_id ORDER BY date DESC NULLS LAST) AS rn
+  FROM twitter_raw
+)
+DELETE FROM twitter_raw t
+USING ranked r
+WHERE t.ctid = r.ctid AND r.rn > 1;
+")
+
+dbExecute(con, "
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'twitter_raw'::regclass AND contype = 'p'
+  ) THEN
+    ALTER TABLE twitter_raw
+      ADD CONSTRAINT twitter_raw_pkey PRIMARY KEY (tweet_id);
+  END IF;
+END$$;
+")
+
+dbWriteTable(con, "tmp_twitter_raw", all_tweets, temporary = TRUE, overwrite = TRUE)
+
+dbExecute(con, "
+  WITH dedup AS (
+    SELECT DISTINCT ON (tweet_id) *
+    FROM tmp_twitter_raw
+    ORDER BY tweet_id, date DESC
+  )
+  INSERT INTO twitter_raw AS t
+    (tweet_id, tweet_url, username, user_id, text, reply_count,
+     retweet_count, like_count, quote_count, bookmarked_count,
+     view_count, date, is_quote, is_retweet, engagement_rate)
+  SELECT tweet_id, tweet_url, username, user_id, text, reply_count,
+         retweet_count, like_count, quote_count, bookmarked_count,
+         view_count, date::timestamptz, is_quote, is_retweet, engagement_rate
+  FROM dedup
+  ON CONFLICT (tweet_id) DO UPDATE SET
+    tweet_url        = EXCLUDED.tweet_url,
+    reply_count      = EXCLUDED.reply_count,
+    retweet_count    = EXCLUDED.retweet_count,
+    like_count       = EXCLUDED.like_count,
+    quote_count      = EXCLUDED.quote_count,
+    bookmarked_count = EXCLUDED.bookmarked_count,
+    view_count       = EXCLUDED.view_count,
+    engagement_rate  = EXCLUDED.engagement_rate;
+")
+
+dbExecute(con, "DROP TABLE IF EXISTS tmp_twitter_raw;")
+
+# 4b – user_followers (robust write) ----------------------------
+dbExecute(con, "
+  CREATE TABLE IF NOT EXISTS user_followers (
+    user_id         text,
+    username        text,
+    followers_count bigint,
+    snapshot_time   timestamptz DEFAULT now(),
+    PRIMARY KEY (user_id, snapshot_time)
+  );
+")
+
+followers_df <- followers_df %>%
+  mutate(
+    user_id         = as.character(user_id),
+    username        = as.character(username),
+    followers_count = suppressWarnings(as.numeric(followers_count)),
+    snapshot_time   = as.POSIXct(snapshot_time, tz = 'UTC')
+  ) %>%
+  filter(!is.na(user_id), nzchar(user_id),
+         !is.na(username), nzchar(username))
+
+if (nrow(followers_df) > 0) {
+  dbWriteTable(con, "tmp_user_followers", followers_df,
+               temporary = TRUE, overwrite = TRUE)
+
+  dbExecute(con, "
+    INSERT INTO user_followers (user_id, username, followers_count, snapshot_time)
+    SELECT
+      user_id,
+      username,
+      COALESCE(followers_count, 0)::bigint,
+      snapshot_time::timestamptz
+    FROM tmp_user_followers
+    WHERE user_id IS NOT NULL AND user_id <> '' AND username IS NOT NULL AND username <> ''
+    ON CONFLICT DO NOTHING;
+  ")
+
+  dbExecute(con, "DROP TABLE IF EXISTS tmp_user_followers;")
+} else {
+  message("(i) No valid follower snapshots to insert this run.")
+}
+
+# 5 – wrap up ----------------------------------------------------
+dbDisconnect(con)
+message(sprintf("✅ (%s) Tweets & follower counts upserted at %s",
+                SCRAPE_MODE, as.character(Sys.time())))
+
